@@ -421,68 +421,100 @@ async function processOrder(invoiceId, visualId, statusName, deliveryName) {
   console.log(`[process] ${tag}: Status → "${newStatusName}" ✓  — all done`);
 }
 
-// ── WEBHOOK ENDPOINT ──────────────────────────────────────────────────────────
+// ── POLLER ────────────────────────────────────────────────────────────────────
 
-app.post('/webhook', async (req, res) => {
-  // Respond 200 immediately so Printavo doesn't retry
-  res.status(200).json({ received: true });
+// How often to poll Printavo for newly-completed orders (milliseconds).
+const POLL_INTERVAL_MS = 10 * 60 * 1000; // 10 minutes
 
-  // Log full payload on every call (helps debug Printavo's actual format)
-  console.log('=== PRINTAVO WEBHOOK ===');
-  console.log(JSON.stringify(req.body, null, 2));
-  console.log('========================');
-
+/**
+ * Poll Printavo for orders that are in a trigger status with a UPS delivery
+ * method and don't yet have a shipping fee. Process each one.
+ */
+async function pollPrintavo() {
+  console.log('[poll] Checking Printavo for completed UPS orders...');
   try {
-    const body = req.body;
+    // Fetch recent invoices across all trigger statuses.
+    // We query each status name individually since Printavo's search is text-based.
+    const allInvoices = [];
 
-    // Printavo webhooks typically wrap the invoice in `data`; handle both
-    const raw = body?.data || body?.invoice || body || {};
+    for (const statusName of TRIGGER_STATUSES) {
+      const data = await printavoQuery(`
+        query($q: String) {
+          invoices(first: 20, query: $q) {
+            nodes {
+              id
+              visualId
+              status { name }
+              deliveryMethod { name }
+              fees { nodes { description amount } }
+              shippingAddress {
+                customerName
+                address1
+                city
+                state
+                zipCode
+              }
+            }
+          }
+        }
+      `, { q: statusName });
 
-    // Extract key fields — handle camelCase and snake_case
-    const invoiceId     = raw?.id || '';
-    const visualId      = raw?.visualId    || raw?.visual_id    || '?';
-    const statusName    = raw?.status?.name                     || '';
-    const deliveryName  = raw?.deliveryMethod?.name
-                        || raw?.delivery_method?.name           || '';
-
-    if (!invoiceId || !statusName) {
-      console.log('[webhook] Missing invoiceId or statusName — ignoring');
-      return;
+      const nodes = data?.invoices?.nodes || [];
+      for (const inv of nodes) {
+        // Exact status match
+        if (inv.status?.name?.trim() !== statusName) continue;
+        allInvoices.push(inv);
+      }
     }
 
-    // Filter: trigger statuses only
-    const isTrigger = TRIGGER_STATUSES.some(
-      t => t.toUpperCase() === statusName.trim().toUpperCase()
-    );
-    if (!isTrigger) {
-      console.log(`[webhook] Status "${statusName}" not a trigger — ignoring`);
-      return;
-    }
-
-    // Filter: UPS delivery methods only
-    const isUPS = UPS_DELIVERY_METHODS.some(
-      d => d.toLowerCase() === deliveryName.trim().toLowerCase()
-    );
-    if (!isUPS) {
-      console.log(`[webhook] Delivery "${deliveryName}" is not UPS — ignoring`);
-      return;
-    }
-
-    // Process async (already responded 200)
-    processOrder(invoiceId, visualId, statusName, deliveryName).catch(err => {
-      console.error('[process] Uncaught error:', err);
-      slackAlert(`Uncaught error on order #${visualId}: ${err.message}`);
+    // Deduplicate by invoice ID (same order may match multiple status queries)
+    const seen = new Set();
+    const candidates = allInvoices.filter(inv => {
+      if (seen.has(inv.id)) return false;
+      seen.add(inv.id);
+      return true;
     });
 
+    console.log(`[poll] Found ${candidates.length} candidate order(s) in trigger statuses`);
+
+    for (const inv of candidates) {
+      const deliveryName = inv.deliveryMethod?.name || '';
+      const isUPS = UPS_DELIVERY_METHODS.some(
+        d => d.toLowerCase() === deliveryName.trim().toLowerCase()
+      );
+      if (!isUPS) continue;
+
+      // Idempotency: skip if real shipping fee already exists
+      const existingFees = inv.fees?.nodes || [];
+      const hasShipping = existingFees.some(f =>
+        (f.description || '').toLowerCase().includes('shipping') &&
+        parseFloat(f.amount || 0) > 0
+      );
+      if (hasShipping) continue;
+
+      console.log(`[poll] Processing order #${inv.visualId} (${inv.status?.name})`);
+      processOrder(inv.id, inv.visualId, inv.status?.name, deliveryName).catch(err => {
+        console.error(`[poll] Error on #${inv.visualId}:`, err.message);
+        slackAlert(`Poll error on order #${inv.visualId}: ${err.message}`);
+      });
+    }
   } catch (err) {
-    console.error('[webhook] Parse error:', err);
-    slackAlert(`Webhook parse error: ${err.message}`);
+    console.error('[poll] Error during poll:', err.message);
+    slackAlert(`Poller error: ${err.message}`);
   }
-});
+}
+
+// ── EXPRESS ───────────────────────────────────────────────────────────────────
 
 // Health check
 app.get('/', (_req, res) => {
-  res.json({ status: 'ok', service: 'easypost-printavo-shipping', version: '1.0.0' });
+  res.json({ status: 'ok', service: 'easypost-printavo-shipping', version: '2.0.0' });
+});
+
+// Manual trigger endpoint — POST /run to force a poll immediately
+app.post('/run', async (req, res) => {
+  res.json({ message: 'Poll triggered' });
+  pollPrintavo();
 });
 
 app.listen(PORT, () => {
@@ -490,4 +522,8 @@ app.listen(PORT, () => {
   if (!PRINTAVO_EMAIL || !PRINTAVO_TOKEN) console.warn('⚠️  PRINTAVO_EMAIL or PRINTAVO_TOKEN not set');
   if (!EASYPOST_API_KEY)  console.warn('⚠️  EASYPOST_API_KEY not set');
   if (!SLACK_WEBHOOK_URL) console.warn('⚠️  SLACK_WEBHOOK_URL not set');
+
+  // Run once on startup, then every POLL_INTERVAL_MS
+  pollPrintavo();
+  setInterval(pollPrintavo, POLL_INTERVAL_MS);
 });

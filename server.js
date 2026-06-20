@@ -20,11 +20,17 @@ app.use(express.json({ limit: '1mb' }));
 
 // ── ENVIRONMENT ──────────────────────────────────────────────────────────────
 
-const PRINTAVO_EMAIL    = process.env.PRINTAVO_EMAIL    || '';
-const PRINTAVO_TOKEN    = process.env.PRINTAVO_TOKEN    || '';
-const EASYPOST_API_KEY  = process.env.EASYPOST_API_KEY  || '';
-const SLACK_WEBHOOK_URL = process.env.SLACK_WEBHOOK_URL || '';
-const PORT              = process.env.PORT              || 3000;
+const PRINTAVO_EMAIL     = process.env.PRINTAVO_EMAIL     || '';
+const PRINTAVO_TOKEN     = process.env.PRINTAVO_TOKEN     || '';
+const EASYPOST_API_KEY   = process.env.EASYPOST_API_KEY   || '';
+const SLACK_BOT_TOKEN    = process.env.SLACK_BOT_TOKEN    || '';
+const SLACK_LUKE_USER_ID = process.env.SLACK_LUKE_USER_ID || 'U0504FSDYB0'; // Luke's Slack user ID
+const PORT               = process.env.PORT               || 3000;
+
+// ── ALERT DEDUPLICATION ───────────────────────────────────────────────────────
+// Tracks order IDs we've already alerted about so we don't spam on repeated polls.
+// Key: "orderId:errorType" — resets on restart (acceptable for a manual-run service).
+const alertedOrders = new Set();
 
 const PRINTAVO_GQL = 'https://www.printavo.com/api/v2';
 
@@ -83,21 +89,47 @@ async function printavoQuery(query, variables = {}) {
 }
 
 /**
- * Post an alert message to Slack (mentions Luke directly).
+ * Send a Slack DM directly to Luke using the Web API.
+ * Uses SLACK_BOT_TOKEN + chat.postMessage so the message goes to Luke's DMs,
+ * not a channel. Falls back to console error if no token is set.
+ *
+ * @param {string} message   - Alert body text
+ * @param {string} [dedupeKey] - Optional key; if provided and already seen, skip sending
  */
-async function slackAlert(message) {
-  if (!SLACK_WEBHOOK_URL) {
-    console.error('[slack] No SLACK_WEBHOOK_URL set — cannot send alert');
+async function slackAlert(message, dedupeKey) {
+  if (dedupeKey) {
+    if (alertedOrders.has(dedupeKey)) {
+      console.log(`[slack] Suppressing duplicate alert for key: ${dedupeKey}`);
+      return;
+    }
+    alertedOrders.add(dedupeKey);
+  }
+
+  if (!SLACK_BOT_TOKEN) {
+    console.error('[slack] No SLACK_BOT_TOKEN set — cannot send DM alert');
+    console.error('[slack] MESSAGE:', message);
     return;
   }
   try {
-    await axios.post(
-      SLACK_WEBHOOK_URL,
-      { text: `🚨 *EasyPost→Printavo* <@U0504FSDYB0>\n${message}` },
-      { timeout: 10000 }
+    const res = await axios.post(
+      'https://slack.com/api/chat.postMessage',
+      {
+        channel: SLACK_LUKE_USER_ID,
+        text: `🚨 *EasyPost→Printavo*\n${message}`,
+      },
+      {
+        headers: {
+          Authorization: `Bearer ${SLACK_BOT_TOKEN}`,
+          'Content-Type': 'application/json',
+        },
+        timeout: 10000,
+      }
     );
+    if (!res.data.ok) {
+      console.error('[slack] chat.postMessage failed:', res.data.error);
+    }
   } catch (err) {
-    console.error('[slack] Failed to send alert:', err.message);
+    console.error('[slack] Failed to send DM alert:', err.message);
   }
 }
 
@@ -265,7 +297,8 @@ async function processOrder(invoiceId, visualId, statusName, deliveryName) {
   const shippingAddress = invoice.shippingAddress;
   if (!shippingAddress || !shippingAddress.zipCode) {
     await slackAlert(
-      `${tag}: Invoice has no shipping address. Cannot look up EasyPost shipments. Status NOT changed.`
+      `${tag}: Invoice has no shipping address. Cannot look up EasyPost shipments. Status NOT changed.`,
+      `${invoiceId}:no-address`
     );
     return;
   }
@@ -282,8 +315,9 @@ async function processOrder(invoiceId, visualId, statusName, deliveryName) {
   if (shipments.length === 0) {
     await slackAlert(
       `${tag} (${statusName}): No EasyPost shipments found matching ` +
-      `${shippingAddress.address1}, ${shippingAddress.zip}.\n` +
-      `Check EasyPost dashboard. Status NOT changed.`
+      `${shippingAddress.address1}, ${shippingAddress.zipCode}.\n` +
+      `Check EasyPost dashboard. Status NOT changed.`,
+      `${invoiceId}:no-shipments`
     );
     return;
   }
@@ -423,8 +457,12 @@ async function processOrder(invoiceId, visualId, statusName, deliveryName) {
 
 // ── POLLER ────────────────────────────────────────────────────────────────────
 
-// How often to poll Printavo for newly-completed orders (milliseconds).
-const POLL_INTERVAL_MS = 10 * 60 * 1000; // 10 minutes
+// ── AUTO-POLL DISABLED ────────────────────────────────────────────────────────
+// Auto-polling is intentionally OFF. Run manually via POST /run until the
+// workflow is fully validated. Re-enable by restoring the setInterval call
+// at the bottom of this file and setting POLL_INTERVAL_MS.
+//
+// const POLL_INTERVAL_MS = 10 * 60 * 1000; // 10 minutes
 
 /**
  * Poll Printavo for orders that are in a trigger status with a UPS delivery
@@ -521,9 +559,10 @@ app.listen(PORT, () => {
   console.log(`EasyPost→Printavo service listening on port ${PORT}`);
   if (!PRINTAVO_EMAIL || !PRINTAVO_TOKEN) console.warn('⚠️  PRINTAVO_EMAIL or PRINTAVO_TOKEN not set');
   if (!EASYPOST_API_KEY)  console.warn('⚠️  EASYPOST_API_KEY not set');
-  if (!SLACK_WEBHOOK_URL) console.warn('⚠️  SLACK_WEBHOOK_URL not set');
-
-  // Run once on startup, then every POLL_INTERVAL_MS
-  pollPrintavo();
-  setInterval(pollPrintavo, POLL_INTERVAL_MS);
+  if (!SLACK_BOT_TOKEN)   console.warn('⚠️  SLACK_BOT_TOKEN not set — Slack DM alerts disabled');
+  console.log('ℹ️  Auto-polling is DISABLED. Trigger manually via POST /run.');
+  // AUTO-POLL DISABLED — manual mode only until workflow is fully validated.
+  // To re-enable: uncomment the two lines below and set POLL_INTERVAL_MS above.
+  // pollPrintavo();
+  // setInterval(pollPrintavo, POLL_INTERVAL_MS);
 });

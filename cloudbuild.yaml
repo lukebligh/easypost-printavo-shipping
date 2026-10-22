@@ -1,0 +1,32 @@
+# Built and deployed by the Cloud Build trigger on every push to main.
+substitutions:
+  _REGION: us-central1
+  _SERVICE: easypost-printavo-shipping
+  _IMAGE: us-central1-docker.pkg.dev/${PROJECT_ID}/apps/easypost-printavo-shipping:${COMMIT_SHA}
+options:
+  dynamicSubstitutions: true
+  logging: CLOUD_LOGGING_ONLY
+steps:
+  - name: gcr.io/cloud-builders/docker
+    args: ["build", "-t", "${_IMAGE}", "."]
+  - name: gcr.io/cloud-builders/docker
+    args: ["push", "${_IMAGE}"]
+  - name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+    entrypoint: gcloud
+    args:
+      - run
+      - deploy
+      - ${_SERVICE}
+      - --image=${_IMAGE}
+      - --region=${_REGION}
+      - --service-account=easypost-run@${PROJECT_ID}.iam.gserviceaccount.com
+      - --allow-unauthenticated
+      # Request-driven (POST /run) — scales to zero when idle.
+      - --min-instances=0
+      - --max-instances=1
+      - --cpu=1
+      - --memory=512Mi
+      - --set-env-vars=PRINTAVO_EMAIL=sales@estmerch.com,SLACK_LUKE_USER_ID=U0504FSDYB0
+      - --set-secrets=EASYPOST_API_KEY=EASYPOST_API_KEY:latest,PRINTAVO_TOKEN=PRINTAVO_TOKEN:latest,SLACK_BOT_TOKEN=SLACK_BOT_TOKEN:latest
+images:
+  - ${_IMAGE}

@@ -29,7 +29,7 @@ In Railway → service → Variables, add:
 |---|---|
 | `PRINTAVO_EMAIL` | `sales@estmerch.com` |
 | `PRINTAVO_TOKEN` | *(from Printavo Settings → API)* |
-| `EASYPOST_API_KEY` | `EZAKd497933544664d368c38e09d712bf8cfD` |
+| `EASYPOST_API_KEY` | `*(stored in Google Secret Manager — never commit keys)*` |
 | `SLACK_WEBHOOK_URL` | *(copy from the existing Printavo MCP service's variables)* |
 
 Railway auto-sets `PORT` — the service reads it automatically.
